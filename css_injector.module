@@ -1,0 +1,332 @@
+<?php
+// $Id: css_injector.module,v 1.1.2.4 2008/08/10 01:56:58 add1sun Exp $
+
+/**
+ * @file
+ * Allows administrators to inject CSS into the page output based on
+ * configurable rules. Useful for adding simple CSS tweaks without modifying
+ * a site's official theme.
+ */
+
+/**
+ * Implementation of hook_help().
+ */
+function css_injector_help($path, $arg) {
+  $output = '';
+  switch ($path) {
+    case 'admin/settings/modules#description':
+      $output .= t('Allows administrators to inject CSS into the page output based on configurable rules.');
+      break;
+    case 'admin/settings/css_injector':
+      $output .= '<p>'. t('Use CSS injection rules to add small snippets of CSS to the page output when specific criteria are met. For example, a simple rule could change the page background color at night or float a particular div to the right on node editing pages.') .'</p>';
+      $output .= '<p>'. t('An important point to keep in mind is that in Drupal, themes always get last crack at display. Theme CSS is applied after modules. That means themes can and will override CSS put into play by CSS Injector module. If you want to override CSS that a theme is already applying, use CSS rules the way they were intended -- higher specificity rules, or the !important flag.') .'</p>';
+      break;
+  }
+  return $output;
+}
+
+/**
+ * Implementation of hook_init().
+ * Checks to see whether any CSS files should be added to the current page,
+ * based on rules configured by the site administrator.
+ */
+function css_injector_init() {
+  $css_rules = _css_injector_load_rule();
+  foreach ($css_rules as $css_rule) {
+    if (_css_injector_evaluate_rule($css_rule)) {
+      drupal_add_css(file_create_path($css_rule['file_path']), 'module', $css_rule['media'], $css_rule['preprocess']);
+    }
+  }
+}
+
+/**
+ * Implementation of hook_menu().
+ * Defines menu callbacks for CSS Injector's configuration pages.
+ */
+function css_injector_menu() {
+  $items = array(
+    'admin/settings/css_injector' => array(
+      'title' => 'CSS injector',
+      'description' => 'Add CSS to the page output based on configurable rules.',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('css_injector_admin_form'),
+      'access arguments' => array('administer css injection'),
+      'file' => 'css_injector.admin.inc',
+    ),
+    'admin/settings/css_injector/edit' => array(
+      'title' => 'Edit CSS injector rule',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('css_injector_edit'),
+      'access arguments' => array('administer css injection'),
+      'file' => 'css_injector.admin.inc',
+      'type' => MENU_CALLBACK,
+    ),
+    'admin/settings/css_injector/add' => array(
+      'title' => 'Add CSS injector rule',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('css_injector_edit'),
+      'access arguments' => array('administer css injection'),
+      'file' => 'css_injector.admin.inc',
+      'type' => MENU_CALLBACK,
+    ),
+    'admin/settings/css_injector/delete' => array(
+      'title' => 'Delete CSS injector rule',
+      'page callback' => 'drupal_get_form',
+      'page arguments' => array('css_injector_delete_confirm'),
+      'access arguments' => array('administer css injection'),
+      'file' => 'css_injector.admin.inc',
+      'type' => MENU_CALLBACK,
+    ),
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function css_injector_theme() {
+  $items['css_injector_admin_form'] = array(
+    'arguments' => array('form' => array()),
+    'file' => 'css_injector.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_perm().
+ */
+function css_injector_perm() {
+  return array('administer css injection', 'edit css');
+}
+
+/**
+ * Helper function to load all CSS injection rules.
+ */
+function _css_injector_load_rule($crid = NULL, $reset = FALSE) {
+  static $rules;
+  if (!isset($rules) || $reset) {
+    if (!$reset && ($cache = cache_get('css_injector:rules')) && !empty($cache->data)) {
+      $rules = $cache->data;
+    }
+    else {
+      $rules = array();
+      $results = db_query("SELECT * FROM {css_injector_rule}");
+      while ($rule = db_fetch_array($results)) {
+        $rules[$rule['crid']] = $rule;
+      }
+      cache_set('css_injector:rules', $rules);
+    }
+  }
+
+  if (is_numeric($crid)) {
+    return $rules[$crid];
+  }
+  else {
+    return $rules;
+  }
+}
+
+
+/**
+ * Helper function to load all CSS injection rule for a node.
+ */
+function _css_injector_load_node_rule($nid = NULL) {
+   $rules = array();
+   $results = db_query("SELECT r.* FROM {css_injector_rule} r INNER JOIN {css_injector_node} n ON n.nid=%d AND n.crid=r.crid", $nid);
+   $rule = db_fetch_array($results);
+   return $rule;
+}
+
+/**
+ * Helper function to delete an existing rule and its accompanying file.
+ */
+function _css_injector_delete_rule($crid) {
+  if ($rule = _css_injector_load_rule($crid)) {
+    file_delete(file_create_path($rule['file_path']));
+    db_query("DELETE FROM {css_injector_rule} WHERE crid = %d", $crid);
+    db_query("DELETE FROM {css_injector_node} WHERE crid = %d", $crid);
+  }
+}
+
+/**
+ * Helper function to determine whether a rule's conditions are met.
+ */
+function _css_injector_evaluate_rule($css_rule = array()) {
+  // Match path if necessary.
+  if (!empty($css_rule['rule_conditions'])) {
+    if ($css_rule['rule_type'] < 2) {
+      $path = drupal_get_path_alias($_GET['q']);
+      // Compare with the internal and path alias (if any).
+      $page_match = drupal_match_path($path, $css_rule['rule_conditions']);
+      if ($path != $_GET['q']) {
+        $page_match = $page_match || drupal_match_path($_GET['q'], $css_rule['rule_conditions']);
+      }
+      // When $css_rule['rule_type'] has a value of 0, the rule is matched on
+      // all pages except those listed in $css_rule['rule_conditions'].
+      // When set to 1, it is displayed only on those pages listed in
+      // $css_rule['rule_type'].
+      $page_match = !($css_rule['rule_type'] xor $page_match);
+    }
+    else {
+      $page_match = drupal_eval($css_rule['rule_conditions']);
+    }
+  }
+  else {
+    $page_match = TRUE;
+  }
+  return $page_match;
+}
+
+
+
+/**
+ * Implementation of hook_form_alter().
+ */
+function css_injector_form_alter(&$form, $form_state, $form_id) {
+  if ($form_id == 'node_type_form') {
+    $form['css_injector'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('CSS'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => 32
+     );
+    $form['css_injector']['css_injector_use'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Allow per-node CSS editing for this content type'),
+      '#default_value' => variable_get('css_injector_use_'. $form['#node_type']->type, FALSE),
+      '#description' => t("Only users with 'edit css' permission will see this fieldset") . '<br/><strong>' .  t("Please note: Creative individuals can use CSS to execute code on a client's browser, by injecting JS snippets in place of images and so on. Treat the 'Administer CSS Injector' permission carefully, as you would any other sensitive administrative tool; allowing untrusted individuals to use it is a security risk.") . '</strong>'
+    
+    );
+  }
+  elseif (isset($form['#node']) && $form['#node']->type .'_node_form' == $form_id && is_css_injector($form['#node'])) {
+    // Customize the redirect target and buttons of our own node forms.
+    $form['css_injector'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('CSS'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+      '#weight' => 32
+     );     
+     $rule = _css_injector_load_node_rule($form['nid']['#value']);
+     $rule['css_text'] = file_get_contents($rule['file_path']);
+     
+     $form['css_injector']['css_injector_code'] = array(
+      '#type' => 'textarea',  
+      '#title' => t('CSS Code'),
+      '#default_value' => $rule['css_text'],
+      '#description' => t("Do not include &#60;style&#62; tag"),
+    );
+    $form['css_injector']['css_media'] = array(
+      '#type' => 'select',
+      '#title' => t('Media'),
+      '#description' => t(''),
+      '#options' => array('all' => t('All'), 'screen' => t('Screen'), 'print' => t('Print')),
+      '#default_value' => $rule['media'],
+    );  
+    $form['css_injector']['css_preprocess'] = array(
+      '#type' => 'checkbox',
+      '#title' => t('Preprocess CSS'),
+      '#description' => t(''),
+      '#default_value' => $rule['preprocess'],
+    );
+
+    $form['css_injector']['css_crid'] = array(
+      '#type' => 'hidden',
+      '#value' => $rule['crid'],
+    );            
+    $form['css_injector']['css_file_path'] = array(
+      '#type' => 'hidden',
+      '#value' => $rule['file_path'],
+    ); 
+  }
+}
+
+/**
+ * Implementation of hook_node_type().
+ * Rename or delete the settings variable if a type changes.
+ */
+function css_injector_node_type($op, $info) {
+  switch ($op) {
+    case 'delete':
+      variable_del('css_injector_use_'. $info->type);
+      break;
+    case 'update':
+      if (!empty($info->old_type) && $info->old_type != $info->type) {
+        if (is_css_injector($info->old_type)) {
+          $settings = variable_get('content_profile_'. $info->old_type, array());
+          variable_del('css_injector_use_'. $info->old_type);
+          variable_set('css_injector_use_'. $info->type, 1);
+        }
+      }
+      break;
+  }
+}
+
+/*
+ * Determine if a given node has CSS injection.
+ * @param $type
+ *   The node object or the node's type
+ */
+function is_css_injector($type) {
+  if (is_object($type)) {
+    $type = $type->type;
+  }
+  return variable_get('css_injector_use_'. $type, FALSE);
+}
+
+
+/**
+ * Implementation of hook_nodeapi().
+ */
+function css_injector_nodeapi(&$node, $op, $a3 = NULL, $a4 = NULL) {  
+  switch ($op) {
+    case 'delete':        
+        $rid = db_fetch_object(db_query("SELECT * FROM {css_injector_node} WHERE nid=%d", $node->nid));
+        _css_injector_delete_rule($rid->crid);
+      break;
+    case 'insert':
+      if (isset($node->css_injector_code) && user_access('edit css')) {        
+        $rule = array(
+          'title' => 'node-' . $node->nid,
+          'rule_type' => 1,
+          'rule_conditions' => 'node/' . $node->nid,
+          'media' => $node->css_media,
+          'preprocess' => $node->css_preprocess,
+          'css_text' => $node->css_injector_code,
+        );
+        drupal_write_record('css_injector_rule', $rule);
+        $directory = file_directory_path();
+        $rule['file_path'] = file_create_path($directory .'/css_injector_'. $rule['crid'] .'.css');
+        db_query('INSERT INTO {css_injector_node} (nid, crid) VALUES (%d, %d)', $node->nid, $rule['crid']);
+        drupal_write_record('css_injector_rule', $rule, array('crid'));      
+        file_save_data($rule['css_text'], file_create_path($rule['file_path']), FILE_EXISTS_REPLACE);
+        _css_injector_load_rule(NULL, TRUE);
+      }
+      break;      
+    case 'update':
+      if (isset($node->css_injector_code) && user_access('edit css')) {        
+        $rule = array(
+          'title' => 'node-' . $node->nid,
+          'rule_type' => 1,
+          'rule_conditions' => 'node/' . $node->nid,
+          'media' => $node->css_media,
+          'preprocess' => $node->css_preprocess,
+          'css_text' => $node->css_injector_code,
+        );
+        if (!$node->css_crid) {          
+          drupal_write_record('css_injector_rule', $rule);
+          $directory = file_directory_path();
+          $rule['file_path'] = file_create_path($directory .'/css_injector_'. $rule['crid'] .'.css');
+          db_query('INSERT INTO {css_injector_node} (nid, crid) VALUES (%d, %d)', $node->nid, $rule['crid']);
+        } else {
+          $rule['crid'] = $node->css_crid;
+          $rule['file_path'] = $node->css_file_path;            
+        }
+        drupal_write_record('css_injector_rule', $rule, array('crid'));      
+        file_save_data($rule['css_text'], file_create_path($rule['file_path']), FILE_EXISTS_REPLACE);
+        _css_injector_load_rule(NULL, TRUE);
+      }
+      break;
+  }
+}
